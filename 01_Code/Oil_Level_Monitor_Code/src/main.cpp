@@ -1,18 +1,117 @@
+/*
+ * 스마트 오일 탱크 잔량 모니터링 시스템 (main.cpp)
+ * PlatformIO + ESP32 + AJ-SR04M + Blynk
+ */
+
+// 1. 보안 파일 포함 (secrets.h에서 BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS 정의)
+#include "secrets.h" 
+
+// 2. 라이브러리 포함 (platformio.ini에 정의된 라이브러리)
 #include <Arduino.h>
+#include <WiFi.h>
+#include <BlynkSimpleWiFi.h>
+#include <NewPing.h>
 
-// put function declarations here:
-int myFunction(int, int);
+// 3. 하드웨어 핀 설정 (시스템 설계서 LLD 핀맵 반영)
+#define TRIGGER_PIN 19 // AJ-SR04M Trig 핀은 ESP32 GPIO 25에 연결
+#define ECHO_PIN 18    // AJ-SR04M Echo 핀은 ESP32 GPIO 26에 연결
+#define MAX_DISTANCE 400 // 최대 측정 거리 400cm (4미터). 120cm 탱크에 충분함.
 
-void setup() {
-  // put your setup code here, to run once:
-  int result = myFunction(2, 3);
+// 4. 탱크 환경 설정 (알고리즘 설계 반영)
+const int TANK_HEIGHT_CM = 120; // 기름 탱크 높이 120cm (1200mm)
+const int READ_INTERVAL_MS = 300000; // 측정 및 전송 주기 5분 (300초 = 300,000ms)
+
+// NewPing 객체 및 타이머 객체 생성
+NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE);
+BlynkTimer timer;
+
+// 5. 잔량 데이터를 측정하고 Blynk로 전송하는 핵심 함수
+void sendTankData() {
+  
+  // 5-1. 거리 측정 (초음파)
+  int distance_cm = sonar.ping_cm(); // 센서부터 기름 표면까지의 빈 공간 거리 (L_air)
+
+  // 5-2. 측정 오류 처리 (Data Validation)
+  if (distance_cm <= 0) {
+    Serial.println("측정 오류: 0cm 또는 유효하지 않은 값 수신. 데이터 전송 생략.");
+    return; 
+  }
+
+  // 5-3. 남은 기름 높이 및 퍼센트 계산 (핵심 알고리즘)
+  int oil_level_cm = TANK_HEIGHT_CM - distance_cm; // 실제 남은 기름 높이 (cm)
+
+  // 퍼센트 계산 및 범위 보정
+  int percentage = map(oil_level_cm, 0, TANK_HEIGHT_CM, 0, 100);
+  percentage = constrain(percentage, 0, 100); 
+  
+  // 5-4. Blynk로 데이터 전송
+  Blynk.virtualWrite(V0, distance_cm);
+  Blynk.virtualWrite(V1, percentage);
+
+  // 시리얼 모니터에 로그 출력
+  Serial.print("빈 공간(L_air): ");
+  Serial.print(distance_cm);
+  Serial.print("cm,  잔량(%): ");
+  Serial.print(percentage);
+  Serial.println("%");
 }
 
+
+// loop() 함수: 무한 반복 실행
 void loop() {
-  // put your main code here, to run repeatedly:
+  Blynk.run(); // Blynk 서버와 통신 유지
+  timer.run(); // 타이머 작동
 }
 
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
+// Wi-Fi 연결이 실패했을 때 재시도하고, 성공 시 Blynk에 연결하는 함수
+void connectWiFi() {
+  Serial.print("Connecting to WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASS); // secrets.h 변수 사용
+  
+  // 20초(40번 시도) 동안 연결 시도
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) { 
+    delay(500); // 0.5초 대기
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected successfully.");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
+  } else {
+    // 연결 실패 시 상태 코드를 출력하여 원인을 진단
+    Serial.print("\nWiFi connection failed! Status Code: ");
+    Serial.println(WiFi.status()); 
+    
+    // 상태 코드에 따른 구체적인 오류 진단 출력
+    if (WiFi.status() == 1) Serial.println("Error: WL_NO_SHIELD - Wi-Fi 모듈 감지 안 됨 (하드웨어/라이브러리 문제)");
+    else if (WiFi.status() == 2) Serial.println("Error: WL_NO_SSID_AVAIL - 네트워크 'Sunghyun'을 찾을 수 없음 (SSID 오타 또는 숨김)");
+    else if (WiFi.status() == 3) Serial.println("Error: WL_SCAN_COMPLETED - 스캔 완료");
+    else if (WiFi.status() == 4) Serial.println("Error: WL_CONNECTED - 연결 성공 (현재는 실패 상황이므로 무시)");
+    else if (WiFi.status() == 5) Serial.println("Error: WL_CONNECT_FAILED - 알 수 없는 연결 실패");
+    else if (WiFi.status() == 6) Serial.println("Error: WL_CONNECTION_LOST - 연결 끊김");
+    else if (WiFi.status() == 7) Serial.println("Error: WL_DISCONNECTED - 연결 해제됨");
+    else if (WiFi.status() == 8) Serial.println("Error: WL_WRONG_PASSWORD - 비밀번호 불일치 (PW 오타)");
+    else Serial.println("Error: Unknown Error Code.");
+    
+    Serial.println("Rebooting in 5 seconds...");
+    delay(5000);
+    ESP.restart(); 
+  }
+}
+
+// setup() 함수: ESP32가 부팅될 때 최초 1회 실행
+void setup() {
+  Serial.begin(115200); // 시리얼 통신 속도 설정 
+  
+  // 1. Blynk 연결 시도 (secrets.h의 변수 사용)
+  Serial.println("Blynk 연결 시도...");
+  connectWiFi(); // <--- 새로 정의한 Wi-Fi 진단 함수 호출
+  sendTankData();
+  
+  // 2. 5분마다 sendTankData 함수 실행 예약 
+  timer.setInterval(READ_INTERVAL_MS, sendTankData);
 }
