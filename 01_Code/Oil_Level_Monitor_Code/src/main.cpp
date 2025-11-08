@@ -13,13 +13,18 @@
 #include <NewPing.h>
 
 // 3. 하드웨어 핀 설정 (시스템 설계서 LLD 핀맵 반영)
-#define TRIGGER_PIN 19 // AJ-SR04M Trig 핀은 ESP32 GPIO 25에 연결
-#define ECHO_PIN 18    // AJ-SR04M Echo 핀은 ESP32 GPIO 26에 연결
-#define MAX_DISTANCE 400 // 최대 측정 거리 400cm (4미터). 120cm 탱크에 충분함.
+#define TRIGGER_PIN 19 // AJ-SR04M Trig 핀
+#define ECHO_PIN 18    // AJ-SR04M Echo 핀
+#define MAX_DISTANCE 400 // 최대 측정 거리
 
-// 4. 탱크 환경 설정 (알고리즘 설계 반영)
-const int TANK_HEIGHT_CM = 120; // 기름 탱크 높이 120cm (1200mm)
-const int READ_INTERVAL_MS = 300000; // 측정 및 전송 주기 5분 (300초 = 300,000ms)
+// --- 데드존(Dead Zone) 설정 추가 2025.11.08 ---
+const int MIN_MEASURABLE_DISTANCE_CM = 20; // 센서의 최소 측정 가능 거리 (20cm)
+const int MAX_MEASURABLE_DISTANCE_CM = 120; // 센서의 최대 측정 가능 거리 (탱크 바닥)
+// ------------------------------------------
+
+// . 탱크 환경 설정 (알고리즘 설계 반영)
+const int TANK_HEIGHT_CM = 120; // 기름 탱크 높이
+const int READ_INTERVAL_MS = 1000; // 측정 및 전송 주기
 
 // NewPing 객체 및 타이머 객체 생성
 NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE);
@@ -33,16 +38,20 @@ void sendTankData() {
 
   // 5-2. 측정 오류 처리 (Data Validation)
   if (distance_cm <= 0) {
-    Serial.println("측정 오류: 0cm 또는 유효하지 않은 값 수신. 데이터 전송 생략.");
-    return; 
+    // 0cm가 측정되면 20cm 이내의 '데드존'으로 간주하여 '가득 참'으로 처리
+    distance_cm = MIN_MEASURABLE_DISTANCE_CM; 
+    Serial.println("측정 오류: 20cm 이내 (데드존). 100%로 간주.");
   }
 
   // 5-3. 남은 기름 높이 및 퍼센트 계산 (핵심 알고리즘)
-  int oil_level_cm = TANK_HEIGHT_CM - distance_cm; // 실제 남은 기름 높이 (cm)
 
-  // 퍼센트 계산 및 범위 보정
-  int percentage = map(oil_level_cm, 0, TANK_HEIGHT_CM, 0, 100);
-  percentage = constrain(percentage, 0, 100); 
+  //int oil_level_cm = TANK_HEIGHT_CM - distance_cm;  - 2025.11.08 삭제
+  //int percentage = map(oil_level_cm, 0, TANK_HEIGHT_CM, 0, 100);  - 2025.11.08 삭제
+
+  // 빈 공간(distance_cm)이 20cm(최소)일 때 100%가 되고,
+  // 120cm(최대)일 때 0%가 되도록 매핑. - 2025.11.08 수정
+  int percentage = map(distance_cm, MIN_MEASURABLE_DISTANCE_CM, MAX_MEASURABLE_DISTANCE_CM, 100, 0);
+  percentage = constrain(percentage, 0, 100); // 0% ~ 100% 범위 보정  
   
   // 5-4. Blynk로 데이터 전송
   Blynk.virtualWrite(V0, distance_cm);
