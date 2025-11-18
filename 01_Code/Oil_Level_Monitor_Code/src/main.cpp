@@ -12,6 +12,9 @@
 #include <BlynkSimpleWiFi.h>
 #include <NewPing.h>
 
+#include <ESPmDNS.h> // OTA 장치 검색을 위해 필요
+#include <ArduinoOTA.h> // OTA 핵심 라이브러리
+
 // 3. 하드웨어 핀 설정 (시스템 설계서 LLD 핀맵 반영)
 #define TRIGGER_PIN 19 // AJ-SR04M Trig 핀
 #define ECHO_PIN 18    // AJ-SR04M Echo 핀
@@ -19,12 +22,12 @@
 
 // --- 데드존(Dead Zone) 설정 추가 2025.11.08 ---
 const int MIN_MEASURABLE_DISTANCE_CM = 20; // 센서의 최소 측정 가능 거리 (20cm)
-const int MAX_MEASURABLE_DISTANCE_CM = 120; // 센서의 최대 측정 가능 거리 (탱크 바닥)
+const int MAX_MEASURABLE_DISTANCE_CM = 122; // 센서의 최대 측정 가능 거리 (탱크 바닥)
 // ------------------------------------------
 
 // . 탱크 환경 설정 (알고리즘 설계 반영)
-const int TANK_HEIGHT_CM = 120; // 기름 탱크 높이
-const int READ_INTERVAL_MS = 1000; // 측정 및 전송 주기
+const int TANK_HEIGHT_CM = 122; // 기름 탱크 높이
+const int READ_INTERVAL_MS = 10000; // 측정 및 전송 주기
 
 // NewPing 객체 및 타이머 객체 생성
 NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE);
@@ -70,6 +73,7 @@ void sendTankData() {
 void loop() {
   Blynk.run(); // Blynk 서버와 통신 유지
   timer.run(); // 타이머 작동
+  ArduinoOTA.handle(); // --- OTA 명령 수신 대기 --- 2025.11.12
 }
 
 // Wi-Fi 연결이 실패했을 때 재시도하고, 성공 시 Blynk에 연결하는 함수
@@ -90,6 +94,13 @@ void connectWiFi() {
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
     Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
+
+    // --- OTA 기능 시작 코드 추가 --- 2025.11.12
+    // ESP32의 호스트 이름(네트워크상의 이름) 설정
+    ArduinoOTA.setHostname("Oil_Level_Monitor"); 
+    ArduinoOTA.begin(); // OTA 시작
+    Serial.println("OTA(무선 업데이트) 기능이 활성화되었습니다.");
+
   } else {
     // 연결 실패 시 상태 코드를 출력하여 원인을 진단
     Serial.print("\nWiFi connection failed! Status Code: ");
