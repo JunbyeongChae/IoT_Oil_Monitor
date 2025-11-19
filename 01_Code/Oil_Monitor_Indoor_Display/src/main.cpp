@@ -110,6 +110,7 @@ void loop() {
 #include <TFT_eSPI.h> // 그래픽 라이브러리
 #include <WiFi.h>
 #include <BlynkSimpleEsp32.h>
+#include "driver/rtc_io.h"
 
 TFT_eSPI tft = TFT_eSPI(); // 디스플레이 객체 생성
 TFT_eSprite img = TFT_eSprite(&tft); // 스프라이트(화면 버퍼) 객체 생성
@@ -121,6 +122,12 @@ TFT_eSprite img = TFT_eSprite(&tft); // 스프라이트(화면 버퍼) 객체 �
 #define GAUGE_WIDTH     20   // 게이지 바의 두께
 #define BG_COLOR       TFT_WHITE // 배경 흰색
 #define ARC_BG_COLOR   0xE71C    // 게이지 빈 부분 (연한 회색)
+
+// === 딥 슬립(절전) 설정 === 
+#define WAKEUP_PIN      GPIO_NUM_33 // 버튼 연결 핀 
+#define SCREEN_TIMEOUT  20000       // 화면 켜짐 유지 시간 (10초)
+
+unsigned long startTime; // 시간 측정용 변수
 
 //부채꼴(Arc)을 직접 그려주는 함수
 #define DEG2RAD 0.0174532925
@@ -197,8 +204,34 @@ BLYNK_CONNECTED() {
   Blynk.syncVirtual(V1);
 }
 
+// [절전 모드] 화면 끄고 잠들기
+void goToSleep() {
+  Serial.println("Going to sleep...");
+
+  // [UX] 꺼질 때 Good Bye 메시지
+  img.fillSprite(BG_COLOR);
+  img.setTextColor(TFT_BLACK, BG_COLOR);
+  img.setTextDatum(MC_DATUM);
+  img.setTextSize(1);
+  img.drawString("Good Bye!", 120, 120, 4);
+  img.pushSprite(0, 0);
+  delay(500);
+
+  tft.fillScreen(TFT_BLACK); // 화면 검게 끄기
+  
+  // [PM 수정] 잠자는 동안에도 버튼 핀을 HIGH(3.3V)로 강제 고정 (오작동 방지)
+  rtc_gpio_pullup_en(GPIO_NUM_33);      // 풀업(Pull-up) 활성화
+  rtc_gpio_pulldown_dis(GPIO_NUM_33);   // 풀다운(Pull-down) 비활성화
+  esp_sleep_enable_ext0_wakeup(WAKEUP_PIN, 0); // LOW(0) 신호가 오면 깨어남
+  
+  esp_deep_sleep_start();
+}
+
 void setup() {
   Serial.begin(115200);
+
+  // 버튼 핀 설정 (풀업)
+  pinMode(WAKEUP_PIN, INPUT_PULLUP);
   
   // 1. 디스플레이 켜기
   tft.init();
@@ -219,16 +252,36 @@ void setup() {
   
   img.setTextColor(TFT_BLACK, BG_COLOR); // 연결 중 글씨는 검은색
   img.setTextDatum(MC_DATUM);
-  img.drawString("Connecting...", 120, 120, 2); // 작게 2번 폰트
+  img.drawString("Waking up...", 120, 120, 4); // 작게 2번 폰트
   img.pushSprite(0, 0);
 
   // 3. Blynk 및 Wi-Fi 연결 시작
   Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
   
-  drawGauge(0);
+  // 켜진 시간 기록 시작
+  startTime = millis();
 }
 
 // [무한 반복] Blynk 통신 유지
 void loop() {
   Blynk.run();
+
+  unsigned long currentMillis = millis();
+
+  // 1. 자동 종료 체크 (30초 지나면 꺼짐)
+  if (currentMillis - startTime > SCREEN_TIMEOUT) {
+    goToSleep();
+  }
+
+  // 2. 수동 종료 체크 (버튼 누르면 꺼짐)
+  // 켜진 지 1초(1000ms)가 지난 후에만 작동 (켜자마자 꺼짐 방지)
+  if (currentMillis - startTime > 1000) {
+    // 버튼이 눌리면(LOW)
+    if (digitalRead(WAKEUP_PIN) == LOW) {
+      delay(50); // 디바운싱
+      if (digitalRead(WAKEUP_PIN) == LOW) {
+        goToSleep(); // 즉시 끄기
+      }
+    }
+  }
 }

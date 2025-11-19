@@ -13,7 +13,7 @@
 #include <NewPing.h>
 
 #include <ESPmDNS.h> // OTA 장치 검색을 위해 필요
-#include <ArduinoOTA.h> // OTA 핵심 라이브러리
+//#include <ArduinoOTA.h> // OTA 핵심 라이브러리
 
 // 3. 하드웨어 핀 설정 (시스템 설계서 LLD 핀맵 반영)
 #define TRIGGER_PIN 19 // AJ-SR04M Trig 핀
@@ -68,14 +68,6 @@ void sendTankData() {
   Serial.println("%");
 }
 
-
-// loop() 함수: 무한 반복 실행
-void loop() {
-  Blynk.run(); // Blynk 서버와 통신 유지
-  timer.run(); // 타이머 작동
-  ArduinoOTA.handle(); // --- OTA 명령 수신 대기 --- 2025.11.12
-}
-
 // Wi-Fi 연결이 실패했을 때 재시도하고, 성공 시 Blynk에 연결하는 함수
 void connectWiFi() {
   Serial.print("Connecting to WiFi...");
@@ -96,10 +88,10 @@ void connectWiFi() {
     Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
 
     // --- OTA 기능 시작 코드 추가 --- 2025.11.12
-    // ESP32의 호스트 이름(네트워크상의 이름) 설정
+/*     // ESP32의 호스트 이름(네트워크상의 이름) 설정
     ArduinoOTA.setHostname("Oil_Level_Monitor"); 
     ArduinoOTA.begin(); // OTA 시작
-    Serial.println("OTA(무선 업데이트) 기능이 활성화되었습니다.");
+    Serial.println("OTA(무선 업데이트) 기능이 활성화되었습니다."); */
 
   } else {
     // 연결 실패 시 상태 코드를 출력하여 원인을 진단
@@ -107,6 +99,7 @@ void connectWiFi() {
     Serial.println(WiFi.status()); 
     
     // 상태 코드에 따른 구체적인 오류 진단 출력
+    /* 2025.11.19 오류진단 주석처리
     if (WiFi.status() == 1) Serial.println("Error: WL_NO_SHIELD - Wi-Fi 모듈 감지 안 됨 (하드웨어/라이브러리 문제)");
     else if (WiFi.status() == 2) Serial.println("Error: WL_NO_SSID_AVAIL - 네트워크 'Sunghyun'을 찾을 수 없음 (SSID 오타 또는 숨김)");
     else if (WiFi.status() == 3) Serial.println("Error: WL_SCAN_COMPLETED - 스캔 완료");
@@ -116,6 +109,7 @@ void connectWiFi() {
     else if (WiFi.status() == 7) Serial.println("Error: WL_DISCONNECTED - 연결 해제됨");
     else if (WiFi.status() == 8) Serial.println("Error: WL_WRONG_PASSWORD - 비밀번호 불일치 (PW 오타)");
     else Serial.println("Error: Unknown Error Code.");
+    */
     
     Serial.println("Rebooting in 5 seconds...");
     delay(5000);
@@ -127,11 +121,27 @@ void connectWiFi() {
 void setup() {
   Serial.begin(115200); // 시리얼 통신 속도 설정 
   
-  // 1. Blynk 연결 시도 (secrets.h의 변수 사용)
+  // 1. 초기 Blynk 연결 시도 (secrets.h의 변수 사용)
   Serial.println("Blynk 연결 시도...");
   connectWiFi(); // <--- 새로 정의한 Wi-Fi 진단 함수 호출
   sendTankData();
   
   // 2. 5분마다 sendTankData 함수 실행 예약 
   timer.setInterval(READ_INTERVAL_MS, sendTankData);
+}
+
+// loop() 함수: 무한 반복 실행
+void loop() {
+  //연결 유지 (Keep-Alive) 로직 2025.11.19
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi(); // Wi-Fi 끊기면 재연결 시도
+  }
+
+  if (Blynk.connected()) {
+    Blynk.run();
+  }
+  
+  //ArduinoOTA.handle(); // --- OTA 명령 수신 대기 --- 2025.11.12
+  
+  timer.run(); // 타이머 작동
 }
