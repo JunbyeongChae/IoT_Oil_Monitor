@@ -3,10 +3,11 @@
  * [기능 유지] ESP-NOW 수신 (Blynk 제거됨)
  */
 
+#include "secrets.h"  // WIFI_SSID / WIFI_PASS
 #include <Arduino.h>
-#include <TFT_eSPI.h> 
+#include <TFT_eSPI.h>
 #include <WiFi.h>
-#include <esp_now.h> 
+#include <esp_now.h>
 
 TFT_eSPI tft = TFT_eSPI(); 
 TFT_eSprite img = TFT_eSprite(&tft); 
@@ -132,8 +133,16 @@ void setup() {
   img.drawString("Waiting Signal...", 120, 120, 4); 
   img.pushSprite(0, 0);
 
-  // [ESP-NOW 설정]
-  WiFi.mode(WIFI_STA); 
+  // [Wi-Fi 접속] ESP-NOW는 같은 채널에서만 통하므로, 1호기가 접속한
+  // 공유기와 같은 채널에 서기 위해 동일한 공유기에 접속한다.
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
+    delay(200);
+  }
+
+  // [ESP-NOW 설정] Wi-Fi 접속 성공 여부와 무관하게 계속 진행 (채널 1로라도 시도)
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error initializing ESP-NOW");
     return;
@@ -142,10 +151,15 @@ void setup() {
 }
 
 void loop() {
+  // Wi-Fi가 끊기면 재접속 (채널 동기화 유지)
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+  }
+
   // 1분 이상 데이터가 안 오면 OFFLINE(빨간불) 표시를 위해 화면 갱신
   if (millis() - lastRecvTime > SIGNAL_TIMEOUT) {
-    drawGauge(myData.percentage); 
-    delay(1000); 
+    drawGauge(myData.percentage);
+    delay(1000);
   }
-  delay(100); 
+  delay(100);
 }

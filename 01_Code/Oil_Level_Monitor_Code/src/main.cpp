@@ -39,7 +39,7 @@ const int WDT_TIMEOUT = 60;             // 워치독 60초 (넉넉하게)
 
 unsigned long lastEspNowTime = 0;
 unsigned long lastBotTime = 0;
-int botRequestDelay = 1000; 
+int botRequestDelay = 3000;  // 1s -> 3s: blocking HTTPS 폴링이 ESP-NOW 전송 주기를 방해하지 않도록
 
 // [재부팅 제어 플래그]
 bool shouldReboot = false; // 재부팅 예약 깃발
@@ -47,8 +47,6 @@ bool shouldReboot = false; // 재부팅 예약 깃발
 // === 텔레그램 설정 ===
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
-//int botRequestDelay = 1000; 
-//unsigned long lastBotTime = 0;
 
 // === ESP-NOW 설정 (2호기 MAC 주소) ===
 uint8_t broadcastAddress[] = {0x28, 0x05, 0xA5, 0x0F, 0xBB, 0x30};
@@ -65,6 +63,12 @@ NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE);
 
 // === 원격 업데이트 함수 (텔레그램 명령으로 실행) ===
 void startRemoteUpdate(String url) {
+  // 신뢰 가능한 호스트만 허용 (setInsecure()로 인증서 검증을 생략하므로 최소한의 방어선)
+  if (!url.startsWith("https://github.com/") && !url.startsWith("https://objects.githubusercontent.com/")) {
+    bot.sendMessage(CHAT_ID, "거부: github.com URL만 허용됩니다.", "");
+    return;
+  }
+
   bot.sendMessage(CHAT_ID, "원격 업데이트 시작...\n" + url, "");
   
   // 워치독 해제 (업데이트 중 재부팅 방지)
@@ -96,20 +100,44 @@ void startRemoteUpdate(String url) {
   }
 }
 
+// === 오류/알림 상태 ===
+int failCount = 0;        // 연속 측정 실패(무응답) 횟수
+bool lowAlerted = false;  // 저잔량 알림 중복 방지 (히스테리시스)
+
 // === 데이터 측정 및 전송 ===
 void measureAndSend() {
-  int distance_cm = sonar.ping_cm(); 
-  if (distance_cm == 0) distance_cm = MIN_MEASURABLE_DISTANCE_CM; 
+  int raw = sonar.ping_median(5);        // 5회 핑 중앙값으로 노이즈 억제
+  int distance_cm = sonar.convert_cm(raw);
 
-  int percentage = map(distance_cm, MIN_MEASURABLE_DISTANCE_CM, MAX_MEASURABLE_DISTANCE_CM, 100, 0);
-  percentage = constrain(percentage, 0, 100); 
-  
+  if (raw == 0) {
+    // 에코 없음 = 센서 무응답(진짜 오류). 100%로 둔갑시키지 않고 전송을 건너뛴다.
+    if (++failCount == 5) {
+      bot.sendMessage(CHAT_ID, "⚠️ 초음파 센서 무응답 5회 연속 — 점검 필요", "");
+    }
+    esp_task_wdt_reset();
+    return;
+  }
+  failCount = 0;
+
+  // 데드존(<20cm)→100%, 탱크 바닥보다 멀면(>122cm)→0%
+  distance_cm = constrain(distance_cm, MIN_MEASURABLE_DISTANCE_CM, MAX_MEASURABLE_DISTANCE_CM);
+  int percentage = constrain(
+      map(distance_cm, MIN_MEASURABLE_DISTANCE_CM, MAX_MEASURABLE_DISTANCE_CM, 100, 0), 0, 100);
+
   myData.distance = distance_cm;
   myData.percentage = percentage;
 
   // ESP-NOW 전송 (2호기로)
   esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
-  
+
+  // 저잔량 자동 알림: 15% 이하 진입 시 1회, 25% 이상 회복 시 재무장
+  if (percentage <= 15 && !lowAlerted) {
+    bot.sendMessage(CHAT_ID, "⚠️ 기름 잔량 " + String(percentage) + "% — 주문하세요", "");
+    lowAlerted = true;
+  } else if (percentage >= 25) {
+    lowAlerted = false;
+  }
+
   esp_task_wdt_reset(); // 워치독 밥 주기
 }
 
@@ -158,8 +186,8 @@ void setup() {
   esp_task_wdt_init(WDT_TIMEOUT, true); 
   esp_task_wdt_add(NULL); 
 
-  // Wi-Fi 연결 (텔레그램용)
-  WiFi.mode(WIFI_AP_STA); 
+  // Wi-Fi 연결 (텔레그램 + ESP-NOW 채널 동기화용)
+  WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
   
@@ -200,6 +228,7 @@ void loop() {
     int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
     while (numNewMessages) {
       handleNewMessages(numNewMessages);
+      esp_task_wdt_reset(); // 메시지 폭주 시에도 워치독 리셋 유지
       numNewMessages = bot.getUpdates(bot.last_message_received + 1);
     }
     lastBotTime = currentMillis;
