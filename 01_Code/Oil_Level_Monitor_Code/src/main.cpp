@@ -1,147 +1,217 @@
 /*
- * 스마트 오일 탱크 잔량 모니터링 시스템 (main.cpp)
- * PlatformIO + ESP32 + AJ-SR04M + Blynk
+ * 스마트 오일 탱크 잔량 모니터링 시스템 (1호기: 센서)
+ * 기능: 초음파 측정, ESP-NOW 송신, 텔레그램 봇
+ * [복구된 기능]
+ * - 로컬 OTA (ArduinoOTA)
+ * - 원격 OTA (HTTPUpdate) -> 텔레그램 명령어로 실행
  */
 
-// 1. 보안 파일 포함 (secrets.h에서 BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS 정의)
 #include "secrets.h" 
-
-// 2. 라이브러리 포함 (platformio.ini에 정의된 라이브러리)
 #include <Arduino.h>
 #include <WiFi.h>
-#include <BlynkSimpleWiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h> 
+#include <ArduinoJson.h>
 #include <NewPing.h>
+#include <esp_now.h> 
+#include <esp_task_wdt.h>
 
-#include <ESPmDNS.h> // OTA 장치 검색을 위해 필요
-//#include <ArduinoOTA.h> // OTA 핵심 라이브러리
+// [OTA 및 원격 업데이트 라이브러리 복구]
+#include <ESPmDNS.h>
+#include <ArduinoOTA.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
 
-// 3. 하드웨어 핀 설정 (시스템 설계서 LLD 핀맵 반영)
-#define TRIGGER_PIN 19 // AJ-SR04M Trig 핀
-#define ECHO_PIN 18    // AJ-SR04M Echo 핀
-#define MAX_DISTANCE 400 // 최대 측정 거리
+// === 하드웨어 핀 설정 ===
+#define TRIGGER_PIN 19 
+#define ECHO_PIN 18    
+#define MAX_DISTANCE 400 
 
-// --- 데드존(Dead Zone) 설정 추가 2025.11.08 ---
-const int MIN_MEASURABLE_DISTANCE_CM = 20; // 센서의 최소 측정 가능 거리 (20cm)
-const int MAX_MEASURABLE_DISTANCE_CM = 122; // 센서의 최대 측정 가능 거리 (탱크 바닥)
-// ------------------------------------------
+// === 탱크 설정 ===
+const int MIN_MEASURABLE_DISTANCE_CM = 20; 
+const int MAX_MEASURABLE_DISTANCE_CM = 122; 
+const int TANK_HEIGHT_CM = 122; 
 
-// . 탱크 환경 설정 (알고리즘 설계 반영)
-const int TANK_HEIGHT_CM = 122; // 기름 탱크 높이
-const int READ_INTERVAL_MS = 10000; // 측정 및 전송 주기
+// === 타이머 설정 ===
+const int READ_INTERVAL_MS = 1800000;   // 30분 주기 (텔레그램 알림용)
+const int ESP_NOW_INTERVAL = 1000;      // 1초 주기 (디스플레이 갱신용)
+const int WDT_TIMEOUT = 60;             // 워치독 60초 (넉넉하게)
 
-// NewPing 객체 및 타이머 객체 생성
+unsigned long lastEspNowTime = 0;
+unsigned long lastBotTime = 0;
+int botRequestDelay = 1000; 
+
+// [재부팅 제어 플래그]
+bool shouldReboot = false; // 재부팅 예약 깃발
+
+// === 텔레그램 설정 ===
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+//int botRequestDelay = 1000; 
+//unsigned long lastBotTime = 0;
+
+// === ESP-NOW 설정 (2호기 MAC 주소) ===
+uint8_t broadcastAddress[] = {0x28, 0x05, 0xA5, 0x0F, 0xBB, 0x30};
+
+typedef struct struct_message {
+  int distance;
+  int percentage;
+} struct_message;
+
+struct_message myData;
+esp_now_peer_info_t peerInfo;
+
 NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE);
-BlynkTimer timer;
 
-// 5. 잔량 데이터를 측정하고 Blynk로 전송하는 핵심 함수
-void sendTankData() {
+// === 원격 업데이트 함수 (텔레그램 명령으로 실행) ===
+void startRemoteUpdate(String url) {
+  bot.sendMessage(CHAT_ID, "원격 업데이트 시작...\n" + url, "");
   
-  // 5-1. 거리 측정 (초음파)
-  int distance_cm = sonar.ping_cm(); // 센서부터 기름 표면까지의 빈 공간 거리 (L_air)
+  // 워치독 해제 (업데이트 중 재부팅 방지)
+  esp_task_wdt_deinit(); 
 
-  // 5-2. 측정 오류 처리 (Data Validation)
-  if (distance_cm <= 0) {
-    // 0cm가 측정되면 20cm 이내의 '데드존'으로 간주하여 '가득 참'으로 처리
-    distance_cm = MIN_MEASURABLE_DISTANCE_CM; 
-    Serial.println("측정 오류: 20cm 이내 (데드존). 100%로 간주.");
+  WiFiClientSecure updateClient;
+  updateClient.setInsecure(); // 인증서 무시
+  updateClient.setTimeout(15000); // 타임아웃 15초
+  
+  // [중요] 리다이렉트 허용 (GitHub 지원)
+  httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  httpUpdate.rebootOnUpdate(true);
+
+  t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
+
+  switch (ret) {
+    case HTTP_UPDATE_FAILED:
+      bot.sendMessage(CHAT_ID, "실패: " + httpUpdate.getLastErrorString(), "");
+      // 실패 시 워치독 복구
+      esp_task_wdt_init(WDT_TIMEOUT, true); 
+      esp_task_wdt_add(NULL);
+      break;
+    case HTTP_UPDATE_NO_UPDATES:
+      bot.sendMessage(CHAT_ID, "파일 없음", "");
+      break;
+    case HTTP_UPDATE_OK:
+      bot.sendMessage(CHAT_ID, "성공! 재부팅...", "");
+      break;
   }
+}
 
-  // 5-3. 남은 기름 높이 및 퍼센트 계산 (핵심 알고리즘)
+// === 데이터 측정 및 전송 ===
+void measureAndSend() {
+  int distance_cm = sonar.ping_cm(); 
+  if (distance_cm == 0) distance_cm = MIN_MEASURABLE_DISTANCE_CM; 
 
-  //int oil_level_cm = TANK_HEIGHT_CM - distance_cm;  - 2025.11.08 삭제
-  //int percentage = map(oil_level_cm, 0, TANK_HEIGHT_CM, 0, 100);  - 2025.11.08 삭제
-
-  // 빈 공간(distance_cm)이 20cm(최소)일 때 100%가 되고,
-  // 120cm(최대)일 때 0%가 되도록 매핑. - 2025.11.08 수정
   int percentage = map(distance_cm, MIN_MEASURABLE_DISTANCE_CM, MAX_MEASURABLE_DISTANCE_CM, 100, 0);
-  percentage = constrain(percentage, 0, 100); // 0% ~ 100% 범위 보정  
+  percentage = constrain(percentage, 0, 100); 
   
-  // 5-4. Blynk로 데이터 전송
-  Blynk.virtualWrite(V0, distance_cm);
-  Blynk.virtualWrite(V1, percentage);
+  myData.distance = distance_cm;
+  myData.percentage = percentage;
 
-  // 시리얼 모니터에 로그 출력
-  Serial.print("빈 공간(L_air): ");
-  Serial.print(distance_cm);
-  Serial.print("cm,  잔량(%): ");
-  Serial.print(percentage);
-  Serial.println("%");
+  // ESP-NOW 전송 (2호기로)
+  esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+  
+  esp_task_wdt_reset(); // 워치독 밥 주기
 }
 
-// Wi-Fi 연결이 실패했을 때 재시도하고, 성공 시 Blynk에 연결하는 함수
-void connectWiFi() {
-  Serial.print("Connecting to WiFi...");
-  WiFi.begin(WIFI_SSID, WIFI_PASS); // secrets.h 변수 사용
-  
-  // 20초(40번 시도) 동안 연결 시도
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) { 
-    delay(500); // 0.5초 대기
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected successfully.");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-    Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
-
-    // --- OTA 기능 시작 코드 추가 --- 2025.11.12
-/*     // ESP32의 호스트 이름(네트워크상의 이름) 설정
-    ArduinoOTA.setHostname("Oil_Level_Monitor"); 
-    ArduinoOTA.begin(); // OTA 시작
-    Serial.println("OTA(무선 업데이트) 기능이 활성화되었습니다."); */
-
-  } else {
-    // 연결 실패 시 상태 코드를 출력하여 원인을 진단
-    Serial.print("\nWiFi connection failed! Status Code: ");
-    Serial.println(WiFi.status()); 
+// === 텔레그램 메시지 처리 ===
+void handleNewMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    if (chat_id != CHAT_ID) continue; // 권한 확인
     
-    // 상태 코드에 따른 구체적인 오류 진단 출력
-    /* 2025.11.19 오류진단 주석처리
-    if (WiFi.status() == 1) Serial.println("Error: WL_NO_SHIELD - Wi-Fi 모듈 감지 안 됨 (하드웨어/라이브러리 문제)");
-    else if (WiFi.status() == 2) Serial.println("Error: WL_NO_SSID_AVAIL - 네트워크 'Sunghyun'을 찾을 수 없음 (SSID 오타 또는 숨김)");
-    else if (WiFi.status() == 3) Serial.println("Error: WL_SCAN_COMPLETED - 스캔 완료");
-    else if (WiFi.status() == 4) Serial.println("Error: WL_CONNECTED - 연결 성공 (현재는 실패 상황이므로 무시)");
-    else if (WiFi.status() == 5) Serial.println("Error: WL_CONNECT_FAILED - 알 수 없는 연결 실패");
-    else if (WiFi.status() == 6) Serial.println("Error: WL_CONNECTION_LOST - 연결 끊김");
-    else if (WiFi.status() == 7) Serial.println("Error: WL_DISCONNECTED - 연결 해제됨");
-    else if (WiFi.status() == 8) Serial.println("Error: WL_WRONG_PASSWORD - 비밀번호 불일치 (PW 오타)");
-    else Serial.println("Error: Unknown Error Code.");
-    */
-    
-    Serial.println("Rebooting in 5 seconds...");
-    delay(5000);
-    ESP.restart(); 
+    String text = bot.messages[i].text;
+
+    if (text == "/start") {
+      String msg = "기름 탱크 봇입니다.\n\n";
+      msg += "/status : 상태 확인\n";
+      msg += "/reboot : 재부팅\n";
+      msg += "/update [URL] : 원격 업데이트";
+      bot.sendMessage(chat_id, msg, "");
+    }
+    else if (text == "/status") {
+      String msg = "현재 상태:\n잔량: " + String(myData.percentage) + "%\n거리: " + String(myData.distance) + "cm";
+      bot.sendMessage(chat_id, msg, "");
+    }
+    else if (text == "/reboot") {
+      bot.sendMessage(chat_id, "3초 후 재부팅합니다.", "");
+      // [수정] 즉시 끄지 않고 플래그만 세움 (무한루프 방지)
+      shouldReboot = true; 
+    }
+    else if (text.startsWith("/update ")) {
+      String url = text.substring(8); 
+      url.trim();
+      startRemoteUpdate(url);
+    }
   }
 }
 
-// setup() 함수: ESP32가 부팅될 때 최초 1회 실행
+// === 로컬 OTA 설정 ===
+void setupOTA() {
+  ArduinoOTA.setHostname("Oil_Level_Sensor");
+  ArduinoOTA.begin();
+}
+
 void setup() {
-  Serial.begin(115200); // 시리얼 통신 속도 설정 
+  Serial.begin(115200);
   
-  // 1. 초기 Blynk 연결 시도 (secrets.h의 변수 사용)
-  Serial.println("Blynk 연결 시도...");
-  connectWiFi(); // <--- 새로 정의한 Wi-Fi 진단 함수 호출
-  sendTankData();
+  // 워치독 설정
+  esp_task_wdt_init(WDT_TIMEOUT, true); 
+  esp_task_wdt_add(NULL); 
+
+  // Wi-Fi 연결 (텔레그램용)
+  WiFi.mode(WIFI_AP_STA); 
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
   
-  // 2. 5분마다 sendTankData 함수 실행 예약 
-  timer.setInterval(READ_INTERVAL_MS, sendTankData);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    esp_task_wdt_reset();
+  }
+  Serial.println("\nWiFi Connected!");
+
+  setupOTA();
+
+  // ESP-NOW 초기화
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW Init Failed");
+    ESP.restart();
+  }
+
+  // 2호기 등록
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
 }
 
-// loop() 함수: 무한 반복 실행
 void loop() {
-  //연결 유지 (Keep-Alive) 로직 2025.11.19
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi(); // Wi-Fi 끊기면 재연결 시도
+  unsigned long currentMillis = millis();
+  esp_task_wdt_reset();
+
+  // 1. ESP-NOW 데이터 전송 (1초)
+  if (currentMillis - lastEspNowTime > ESP_NOW_INTERVAL) {
+    measureAndSend(); 
+    lastEspNowTime = currentMillis;
   }
 
-  if (Blynk.connected()) {
-    Blynk.run();
+  // 2. 텔레그램 확인 (1초)
+  if (currentMillis - lastBotTime > botRequestDelay) {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    while (numNewMessages) {
+      handleNewMessages(numNewMessages);
+      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    }
+    lastBotTime = currentMillis;
   }
-  
-  //ArduinoOTA.handle(); // --- OTA 명령 수신 대기 --- 2025.11.12
-  
-  timer.run(); // 타이머 작동
+
+  // 3. 로컬 OTA
+  ArduinoOTA.handle();
+
+  // 4. [수정] 재부팅 처리 (모든 통신 처리 후 실행)
+  if (shouldReboot) {
+    // 텔레그램 서버가 메시지 처리를 인지할 시간을 충분히 줌
+    delay(3000); 
+    ESP.restart();
+  }
 }

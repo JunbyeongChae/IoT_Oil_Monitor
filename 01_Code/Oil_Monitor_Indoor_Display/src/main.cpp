@@ -1,145 +1,47 @@
 /*
- * 스마트 오일 탱크 실내 모니터 (main.cpp)
- * (5핀 ESP32 + 0.96" OLED)
- * - Blynk 서버의 V1 핀 데이터를 수신하여 화면에 표시
+ * 스마트 오일 탱크 실내 모니터 (2호기: 디스플레이)
+ * [기능 유지] ESP-NOW 수신 (Blynk 제거됨)
+ */
 
-
-// 1. 보안 파일 포함 (Wi-Fi 및 Blynk 토큰)
-#include "secrets.h" 
-
-// 2. 라이브러리 포함 (platformio.ini에 정의됨)
 #include <Arduino.h>
+#include <TFT_eSPI.h> 
 #include <WiFi.h>
-#include <BlynkSimpleWiFi.h>
+#include <esp_now.h> 
 
-// 3. OLED 라이브러리 포함
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+TFT_eSPI tft = TFT_eSPI(); 
+TFT_eSprite img = TFT_eSprite(&tft); 
 
-// 4. OLED 화면 설정
-#define SCREEN_WIDTH 128 // OLED 너비 (픽셀)
-#define SCREEN_HEIGHT 64 // OLED 높이 (픽셀)
-#define OLED_RESET    -1 // 리셋 핀 (-1은 ESP32 리셋 공유)
-// I2C 핀은 기본값 (SDA=21, SCL=22)을 사용합니다.
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// === UI 디자인 설정 (요청하신 값 적용) ===
+#define GAUGE_CENTER_X  120  
+#define GAUGE_CENTER_Y  120  
+#define GAUGE_RADIUS    95   
+#define GAUGE_WIDTH     20   
+#define BG_COLOR        TFT_WHITE // [복구] 배경 흰색
+#define ARC_BG_COLOR    0xE71C    // [복구] 트랙 연한 회색
 
-// Wi-Fi 연결 함수 (기존 코드와 동일)
-void connectWiFi() {
-  Serial.print("Connecting to WiFi...");
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) { 
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected successfully.");
-    Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
-  } else {
-    Serial.println("\nWiFi Failed! Rebooting...");
-    delay(5000);
-    ESP.restart(); 
-  }
-}
+// [변수] 데이터 저장
+typedef struct struct_message {
+  int distance;
+  int percentage;
+} struct_message;
 
-// OLED 화면에 잔량을 표시하는 함수
-void displayPercentage(int percentage) {
-  display.clearDisplay();     // 1. 화면을 지웁니다.
-  display.setTextSize(4);     // 2. 글자 크기를 크게 설정합니다.
-  display.setTextColor(SSD1306_WHITE); // 3. 글자 색상을 흰색으로 합니다.
-  
-  // 4. 숫자 위치를 가운데로 맞춥니다.
-  int16_t x1, y1;
-  uint16_t w, h;
-  String text = String(percentage) + "%"; // "83%"
-  display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
-  display.setCursor((SCREEN_WIDTH - w) / 2, (SCREEN_HEIGHT - h) / 2);
+struct_message myData;
 
-  display.println(text);      // 5. "83%" 라고 씁니다.
-  display.display();          // 6. 화면에 실제로 표시합니다!
-}
+// 통신 상태 확인 (1분간 데이터 없으면 오프라인 처리)
+unsigned long lastRecvTime = 0;
+const unsigned long SIGNAL_TIMEOUT = 60000; 
 
-// 5. (핵심) Blynk 서버에서 V1 핀 값이 변경될 때마다 자동 호출되는 함수
-BLYNK_WRITE(V1)
-{
-  int percentage = param.asInt(); // 서버에서 전송된 새 잔량(%) 값을 받습니다.
-  Serial.print("Blynk 서버에서 새 잔량 수신: ");
-  Serial.println(percentage);
-  
-  // OLED 화면에 새 잔량(%) 값을 표시합니다.
-  displayPercentage(percentage);
-}
-
-// setup() 함수: ESP32가 부팅될 때 최초 1회 실행
-void setup() {
-  Serial.begin(115200);
-
-  // 1. OLED 디스플레이 초기화
-  // 0x3C는 128x64 OLED의 일반적인 I2C 주소입니다.
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
-    Serial.println(F("SSD1306 OLED 할당 실패"));
-    for(;;); // OLED가 없으면 무한 루프
-  }
-  Serial.println(F("OLED 디스플레이 초기화 성공."));
-  
-  // 2. 초기 화면 표시
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0,0);
-  display.println("Oil Monitor Display");
-  display.println("Connecting...");
-  display.display();
-
-  // 3. Wi-Fi 및 Blynk 연결
-  connectWiFi();
-
-  // Blynk 서버에 "V1 핀의 가장 최근 값을 즉시 보내달라"고 요청합니다.
-  Blynk.syncVirtual(V1);
-}
-
-// loop() 함수: 무한 반복 실행
-void loop() {
-  Blynk.run(); // Blynk 서버와 통신 유지
-} --- 2025.11.18 디스플레이변경*/
-
-#include "secrets.h" // 보안 파일
-#include <Arduino.h>
-#include <TFT_eSPI.h> // 그래픽 라이브러리
-#include <WiFi.h>
-#include <BlynkSimpleEsp32.h>
-#include "driver/rtc_io.h"
-
-TFT_eSPI tft = TFT_eSPI(); // 디스플레이 객체 생성
-TFT_eSprite img = TFT_eSprite(&tft); // 스프라이트(화면 버퍼) 객체 생성
-
-// === 게이지 UI 설정값
-#define GAUGE_CENTER_X  120  // 게이지 중심 X 좌표
-#define GAUGE_CENTER_Y  120  // 게이지 중심 Y 좌표
-#define GAUGE_RADIUS    95  // 게이지 전체 반지름
-#define GAUGE_WIDTH     20   // 게이지 바의 두께
-#define BG_COLOR       TFT_WHITE // 배경 흰색
-#define ARC_BG_COLOR   0xE71C    // 게이지 빈 부분 (연한 회색)
-
-// === 딥 슬립(절전) 설정 === 
-#define WAKEUP_PIN      GPIO_NUM_33 // 버튼 연결 핀 
-#define SCREEN_TIMEOUT  20000       // 화면 켜짐 유지 시간 (10초)
-
-unsigned long startTime; // 시간 측정용 변수
-
-//부채꼴(Arc)을 직접 그려주는 함수
+// ==================================================================================
+// [함수] fillArc: 부채꼴 그리기
+// ==================================================================================
 #define DEG2RAD 0.0174532925
 void fillArc(int x, int y, int start_angle, int end_angle, int r, int w, unsigned int color) {
-  // 각도 보정
   if (start_angle > end_angle) {
     int temp = start_angle;
     start_angle = end_angle;
     end_angle = temp;
   }
 
-  // 1도씩 쪼개서 부채꼴 그리기
   for (int i = start_angle; i < end_angle; i++) {
     float sx = cos((i - 90) * DEG2RAD);
     float sy = sin((i - 90) * DEG2RAD);
@@ -160,128 +62,90 @@ void fillArc(int x, int y, int start_angle, int end_angle, int r, int w, unsigne
   }
 }
 
-// 화면에 게이지를 그리는 함수
+// ==================================================================================
+// [함수] drawGauge: 화면 그리기
+// ==================================================================================
 void drawGauge(int percentage) {
-  // 1. 스프라이트 배경 지우기
-  img.fillSprite(BG_COLOR);
+  img.fillSprite(BG_COLOR); // 흰색으로 지우기
 
-  // 2. 색상 결정 (단계별 색상)
+  // 1. 게이지 색상 결정
   uint16_t gauge_color = 0x1CC3; // 진초록
   if (percentage < 20) gauge_color = TFT_RED;
   else if (percentage < 40) gauge_color = TFT_ORANGE;
 
-  // 3. 배경 게이지 (회색) 그리기 (0 ~ 100% 전체 구간)
+  // 2. 배경 게이지 그리기 (연한 회색)
   int startAngle = 225; 
   int totalAngle = 270; 
-
   fillArc(GAUGE_CENTER_X, GAUGE_CENTER_Y, startAngle, startAngle + totalAngle, GAUGE_RADIUS, GAUGE_WIDTH, ARC_BG_COLOR);
 
-  // 4. 채워진 게이지 바 그리기
-  int fillSpan = map(percentage, 0, 100, 0, totalAngle); // %를 각도로 변환
+  // 3. 잔량 게이지 그리기
+  int fillSpan = map(percentage, 0, 100, 0, totalAngle); 
   fillArc(GAUGE_CENTER_X, GAUGE_CENTER_Y, startAngle, startAngle + fillSpan, GAUGE_RADIUS, GAUGE_WIDTH, gauge_color);
 
-  // 5. 중앙 텍스트 표시
-  img.setTextColor(gauge_color, BG_COLOR); // 글자색, 배경색
-  img.setTextDatum(MC_DATUM); // 정중앙 정렬
-  img.setTextSize(6);
-
+  // 4. 텍스트 표시 (흰 배경이므로 글자는 검은색)
+  img.setTextColor(gauge_color, BG_COLOR); 
+  img.setTextDatum(MC_DATUM); 
+  
+  img.setTextSize(6); // 요청하신 큰 사이즈
   String perStr = String(percentage) + "%";
   img.drawString(perStr, GAUGE_CENTER_X, GAUGE_CENTER_Y - 4);
 
-  // 6. 화면에 실제로 표시
-  img.pushSprite(0, 0);
-}
-
-// [Blynk 데이터 수신] 서버에서 V1 데이터가 들어오면 자동 실행
-BLYNK_WRITE(V1) {
-  int receivedValue = param.asInt(); // 들어온 값 (잔량 %)
-  // 받은 값으로 화면 갱신
-  drawGauge(receivedValue);
-}
-
-// --- 접속시작시 최신 데이터 요청 ---
-BLYNK_CONNECTED() {
-  Blynk.syncVirtual(V1);
-}
-
-// [절전 모드] 화면 끄고 잠들기
-void goToSleep() {
-  Serial.println("Going to sleep...");
-
-  // [UX] 꺼질 때 Good Bye 메시지
-  img.fillSprite(BG_COLOR);
-  img.setTextColor(TFT_BLACK, BG_COLOR);
-  img.setTextDatum(MC_DATUM);
+  // 5. 온라인/오프라인 상태 표시 (주신 코드 스타일 적용)
+  bool isConnected = (millis() - lastRecvTime < SIGNAL_TIMEOUT);
+  uint16_t statusColor = isConnected ? TFT_GREEN : TFT_RED; 
+  String statusText = isConnected ? "ONLINE" : "OFFLINE";
+  
+  // 점 그리기
+  img.fillCircle(120, 170, 8, statusColor); 
+  img.drawCircle(120, 170, 8, TFT_BLACK); 
+  
+  // 상태 텍스트
+  img.setTextColor(TFT_BLACK, BG_COLOR); // 검은 글씨
   img.setTextSize(1);
-  img.drawString("Good Bye!", 120, 120, 4);
-  img.pushSprite(0, 0);
-  delay(500);
+  img.drawString(statusText, 120, 190, 2);
 
-  tft.fillScreen(TFT_BLACK); // 화면 검게 끄기
-  
-  // [PM 수정] 잠자는 동안에도 버튼 핀을 HIGH(3.3V)로 강제 고정 (오작동 방지)
-  rtc_gpio_pullup_en(GPIO_NUM_33);      // 풀업(Pull-up) 활성화
-  rtc_gpio_pulldown_dis(GPIO_NUM_33);   // 풀다운(Pull-down) 비활성화
-  esp_sleep_enable_ext0_wakeup(WAKEUP_PIN, 0); // LOW(0) 신호가 오면 깨어남
-  
-  esp_deep_sleep_start();
+  img.pushSprite(0, 0);
+}
+
+// [ESP-NOW] 데이터 수신 콜백
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  memcpy(&myData, incomingData, sizeof(myData));
+  lastRecvTime = millis(); // 수신 시간 갱신 (ONLINE 유지)
+  drawGauge(myData.percentage);
 }
 
 void setup() {
   Serial.begin(115200);
-
-  // 버튼 핀 설정 (풀업)
-  pinMode(WAKEUP_PIN, INPUT_PULLUP);
   
-  // 1. 디스플레이 켜기
   tft.init();
-  tft.setRotation(0); // 화면 방향
+  tft.setRotation(0); 
   tft.fillScreen(BG_COLOR);
 
-  // 컬러 깊이를 8비트로 설정하여 메모리 절약
   img.setColorDepth(8);
-  
-  // 2. 접속 중 메시지 표시
-  // 메모리 할당 확인
   void* ptr = img.createSprite(240, 240);
-  if (ptr == NULL) {
-    Serial.println("Sprite creation failed! Not enough RAM.");
-    return;
-  }
+  if (ptr == NULL) return;
   img.fillSprite(BG_COLOR);
   
-  img.setTextColor(TFT_BLACK, BG_COLOR); // 연결 중 글씨는 검은색
+  // 부팅 화면
+  img.setTextColor(TFT_BLACK, BG_COLOR); 
   img.setTextDatum(MC_DATUM);
-  img.drawString("Waking up...", 120, 120, 4); // 작게 2번 폰트
+  img.drawString("Waiting Signal...", 120, 120, 4); 
   img.pushSprite(0, 0);
 
-  // 3. Blynk 및 Wi-Fi 연결 시작
-  Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
-  
-  // 켜진 시간 기록 시작
-  startTime = millis();
+  // [ESP-NOW 설정]
+  WiFi.mode(WIFI_STA); 
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  esp_now_register_recv_cb(OnDataRecv);
 }
 
-// [무한 반복] Blynk 통신 유지
 void loop() {
-  Blynk.run();
-
-  unsigned long currentMillis = millis();
-
-  // 1. 자동 종료 체크 (30초 지나면 꺼짐)
-  if (currentMillis - startTime > SCREEN_TIMEOUT) {
-    goToSleep();
+  // 1분 이상 데이터가 안 오면 OFFLINE(빨간불) 표시를 위해 화면 갱신
+  if (millis() - lastRecvTime > SIGNAL_TIMEOUT) {
+    drawGauge(myData.percentage); 
+    delay(1000); 
   }
-
-  // 2. 수동 종료 체크 (버튼 누르면 꺼짐)
-  // 켜진 지 1초(1000ms)가 지난 후에만 작동 (켜자마자 꺼짐 방지)
-  if (currentMillis - startTime > 1000) {
-    // 버튼이 눌리면(LOW)
-    if (digitalRead(WAKEUP_PIN) == LOW) {
-      delay(50); // 디바운싱
-      if (digitalRead(WAKEUP_PIN) == LOW) {
-        goToSleep(); // 즉시 끄기
-      }
-    }
-  }
+  delay(100); 
 }
