@@ -36,6 +36,7 @@ const int TANK_HEIGHT_CM = 122;
 const int READ_INTERVAL_MS = 1800000;   // 30분 주기 (텔레그램 알림용)
 const int ESP_NOW_INTERVAL = 1000;      // 1초 주기 (디스플레이 갱신용)
 const int WDT_TIMEOUT = 60;             // 워치독 60초 (넉넉하게)
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000; // 부팅 시 Wi-Fi 대기 한도 (초과 시 재시작)
 
 unsigned long lastEspNowTime = 0;
 unsigned long lastBotTime = 0;
@@ -43,6 +44,7 @@ int botRequestDelay = 3000;  // 1s -> 3s: blocking HTTPS 폴링이 ESP-NOW 전�
 
 // [재부팅 제어 플래그]
 bool shouldReboot = false; // 재부팅 예약 깃발
+String pendingUpdateUrl = ""; // 원격 업데이트 예약 (텔레그램 메시지 확인 처리 후 실행)
 
 // === 텔레그램 설정 ===
 WiFiClientSecure client;
@@ -70,32 +72,33 @@ void startRemoteUpdate(String url) {
   }
 
   bot.sendMessage(CHAT_ID, "원격 업데이트 시작...\n" + url, "");
-  
-  // 워치독 해제 (업데이트 중 재부팅 방지)
-  esp_task_wdt_deinit(); 
+
+  // 워치독은 끄지 않고 다운로드 진행 중에 계속 리셋한다.
+  // (IDF 4.4의 esp_task_wdt_deinit()은 구독 태스크가 남아 있으면 실패하므로 해제 방식은 동작하지 않음)
+  httpUpdate.onProgress([](int, int) { esp_task_wdt_reset(); });
+  esp_task_wdt_reset();
 
   WiFiClientSecure updateClient;
   updateClient.setInsecure(); // 인증서 무시
   updateClient.setTimeout(15000); // 타임아웃 15초
-  
+
   // [중요] 리다이렉트 허용 (GitHub 지원)
   httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  httpUpdate.rebootOnUpdate(true);
+  // 자동 재부팅 끔: update() 안에서 바로 재부팅하면 결과 메시지를 못 보내므로 loop()의 재부팅 경로를 사용
+  httpUpdate.rebootOnUpdate(false);
 
   t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
 
   switch (ret) {
     case HTTP_UPDATE_FAILED:
       bot.sendMessage(CHAT_ID, "실패: " + httpUpdate.getLastErrorString(), "");
-      // 실패 시 워치독 복구
-      esp_task_wdt_init(WDT_TIMEOUT, true); 
-      esp_task_wdt_add(NULL);
       break;
     case HTTP_UPDATE_NO_UPDATES:
       bot.sendMessage(CHAT_ID, "파일 없음", "");
       break;
     case HTTP_UPDATE_OK:
       bot.sendMessage(CHAT_ID, "성공! 재부팅...", "");
+      shouldReboot = true;
       break;
   }
 }
@@ -166,9 +169,11 @@ void handleNewMessages(int numNewMessages) {
       shouldReboot = true; 
     }
     else if (text.startsWith("/update ")) {
-      String url = text.substring(8); 
+      String url = text.substring(8);
       url.trim();
-      startRemoteUpdate(url);
+      // [수정] 바로 실행하지 않고 예약만 함. 확인 처리 전에 재부팅하면
+      // 재부팅 후 같은 /update 메시지를 다시 받아 업데이트가 무한 반복된다.
+      pendingUpdateUrl = url;
     }
   }
 }
@@ -191,7 +196,13 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
   
+  unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED) {
+    // 공유기 인증 실패 등 자동 재접속이 안 되는 상태에 갇히지 않도록 한도 초과 시 재시작
+    if (millis() - wifiStart > WIFI_CONNECT_TIMEOUT_MS) {
+      Serial.println("\nWiFi connect timeout, restarting...");
+      ESP.restart();
+    }
     delay(500);
     Serial.print(".");
     esp_task_wdt_reset();
@@ -234,10 +245,17 @@ void loop() {
     lastBotTime = currentMillis;
   }
 
-  // 3. 로컬 OTA
+  // 3. 원격 업데이트 (위 폴링에서 /update 메시지 확인 처리가 끝난 뒤 실행)
+  if (pendingUpdateUrl.length() > 0) {
+    String url = pendingUpdateUrl;
+    pendingUpdateUrl = "";
+    startRemoteUpdate(url);
+  }
+
+  // 4. 로컬 OTA
   ArduinoOTA.handle();
 
-  // 4. [수정] 재부팅 처리 (모든 통신 처리 후 실행)
+  // 5. [수정] 재부팅 처리 (모든 통신 처리 후 실행)
   if (shouldReboot) {
     // 텔레그램 서버가 메시지 처리를 인지할 시간을 충분히 줌
     delay(3000); 
