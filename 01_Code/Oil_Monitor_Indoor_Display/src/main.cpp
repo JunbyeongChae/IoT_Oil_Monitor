@@ -28,9 +28,18 @@ typedef struct struct_message {
 
 struct_message myData;
 
+// 수신 콜백(Wi-Fi 태스크)과 loop() 사이 공유 데이터 보호
+portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool newDataReady = false;
+
 // 통신 상태 확인 (1분간 데이터 없으면 오프라인 처리)
-unsigned long lastRecvTime = 0;
-const unsigned long SIGNAL_TIMEOUT = 60000; 
+volatile unsigned long lastRecvTime = 0;
+const unsigned long SIGNAL_TIMEOUT = 60000;
+bool shownOnline = true; // 화면에 마지막으로 그린 ONLINE/OFFLINE 상태 (전환 시에만 다시 그림)
+
+// Wi-Fi 재접속 시도 간격 (reconnect()는 진행 중인 접속을 끊고 새로 시작하므로 자주 부르면 안 됨)
+const unsigned long WIFI_RETRY_INTERVAL = 30000;
+unsigned long lastWifiRetry = 0;
 
 // ==================================================================================
 // [함수] fillArc: 부채꼴 그리기
@@ -66,7 +75,7 @@ void fillArc(int x, int y, int start_angle, int end_angle, int r, int w, unsigne
 // ==================================================================================
 // [함수] drawGauge: 화면 그리기
 // ==================================================================================
-void drawGauge(int percentage) {
+void drawGauge(int percentage, bool isConnected) {
   img.fillSprite(BG_COLOR); // 흰색으로 지우기
 
   // 1. 게이지 색상 결정
@@ -92,7 +101,6 @@ void drawGauge(int percentage) {
   img.drawString(perStr, GAUGE_CENTER_X, GAUGE_CENTER_Y - 4);
 
   // 5. 온라인/오프라인 상태 표시 (주신 코드 스타일 적용)
-  bool isConnected = (millis() - lastRecvTime < SIGNAL_TIMEOUT);
   uint16_t statusColor = isConnected ? TFT_GREEN : TFT_RED; 
   String statusText = isConnected ? "ONLINE" : "OFFLINE";
   
@@ -109,10 +117,16 @@ void drawGauge(int percentage) {
 }
 
 // [ESP-NOW] 데이터 수신 콜백
+// 우선순위가 높은 Wi-Fi 태스크에서 실행되므로 여기서는 복사만 하고, 화면 그리기는 loop()에서 한다.
 void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  if (len != sizeof(struct_message)) return; // 형식이 다른 패킷 무시 (버퍼 초과 읽기 방지)
+
+  unsigned long now = millis();
+  portENTER_CRITICAL(&dataMux);
   memcpy(&myData, incomingData, sizeof(myData));
-  lastRecvTime = millis(); // 수신 시간 갱신 (ONLINE 유지)
-  drawGauge(myData.percentage);
+  lastRecvTime = now; // 수신 시간 갱신 (ONLINE 유지)
+  newDataReady = true;
+  portEXIT_CRITICAL(&dataMux);
 }
 
 void setup() {
@@ -136,6 +150,7 @@ void setup() {
   // [Wi-Fi 접속] ESP-NOW는 같은 채널에서만 통하므로, 1호기가 접속한
   // 공유기와 같은 채널에 서기 위해 동일한 공유기에 접속한다.
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false); // 모뎀 절전 중에는 ESP-NOW 패킷을 놓칠 수 있으므로 끔
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
@@ -151,15 +166,29 @@ void setup() {
 }
 
 void loop() {
-  // Wi-Fi가 끊기면 재접속 (채널 동기화 유지)
-  if (WiFi.status() != WL_CONNECTED) {
+  // 수신 데이터 스냅샷 (콜백과 동시 접근 방지)
+  portENTER_CRITICAL(&dataMux);
+  bool hasNewData = newDataReady;
+  newDataReady = false;
+  int percentage = myData.percentage;
+  unsigned long recvTime = lastRecvTime;
+  portEXIT_CRITICAL(&dataMux);
+
+  unsigned long now = millis(); // 스냅샷 뒤에 읽어야 now < recvTime 역전이 없음
+
+  // Wi-Fi가 끊긴 상태면 30초 간격으로만 재접속 시도 (채널 동기화 유지)
+  // 대부분은 자동 재접속이 처리하지만, 인증 실패 등 일부 사유는 자동으로 재시도하지 않는다.
+  if (WiFi.status() != WL_CONNECTED && now - lastWifiRetry > WIFI_RETRY_INTERVAL) {
     WiFi.reconnect();
+    lastWifiRetry = now;
   }
 
-  // 1분 이상 데이터가 안 오면 OFFLINE(빨간불) 표시를 위해 화면 갱신
-  if (millis() - lastRecvTime > SIGNAL_TIMEOUT) {
-    drawGauge(myData.percentage);
-    delay(1000);
+  // 화면은 loop()에서만 그린다: 새 데이터 수신 시, 또는 ONLINE/OFFLINE 전환 시
+  // (1분 이상 데이터가 안 오면 OFFLINE(빨간불)으로 전환)
+  bool isOnline = (now - recvTime < SIGNAL_TIMEOUT);
+  if (hasNewData || isOnline != shownOnline) {
+    drawGauge(percentage, isOnline);
+    shownOnline = isOnline;
   }
   delay(100);
 }
