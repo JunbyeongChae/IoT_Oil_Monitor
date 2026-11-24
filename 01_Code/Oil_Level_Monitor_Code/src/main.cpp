@@ -40,6 +40,13 @@ const int ESP_NOW_INTERVAL = 1000;      // 1초 주기 (디스플레이 갱신�
 const int WDT_TIMEOUT = 60;             // 워치독 60초 (넉넉하게)
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000; // 부팅 시 Wi-Fi 대기 한도 (초과 시 재시작)
 
+// === 네트워크 타임아웃 (워치독보다 충분히 짧게) ===
+// WiFiClientSecure 기본값은 TCP 연결 30초 + TLS 핸드셰이크 120초라서, 인터넷이 느리거나 불안정하면
+// 텔레그램 요청 하나가 워치독(60초)보다 오래 막혀 "워치독 (코드 멈춤 감지)" 재시작이 반복된다.
+// 아래 값은 모두 '초' 단위 (arduino-esp32 2.x의 setTimeout()/setHandshakeTimeout()은 초를 받는다).
+const uint32_t NET_CONNECT_TIMEOUT_S = 8;    // TCP 연결 + 소켓 읽기/쓰기 한도
+const unsigned long TLS_HANDSHAKE_TIMEOUT_S = 10; // TLS 핸드셰이크 한도
+
 // === 자체 복구 설정 ===
 const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;   // Wi-Fi 끊긴 동안 재접속 시도 간격
 const unsigned long WIFI_LOST_RESTART_MS = 300000;    // Wi-Fi가 5분 넘게 복구되지 않으면 재시작
@@ -106,7 +113,8 @@ void startRemoteUpdate(String url) {
 
   WiFiClientSecure updateClient;
   updateClient.setInsecure(); // 인증서 무시
-  updateClient.setTimeout(15000); // 타임아웃 15초
+  updateClient.setTimeout(15); // 타임아웃 15초 (단위: 초. 이전 15000은 15000초였음)
+  updateClient.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_S);
 
   // [중요] 리다이렉트 허용 (GitHub 지원)
   httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
@@ -325,6 +333,8 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+  client.setTimeout(NET_CONNECT_TIMEOUT_S);
+  client.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_S);
   
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED) {
@@ -383,12 +393,15 @@ void loop() {
   }
 
   // 4. 텔레그램 연결 점검 (10분)
+  // 폴링과 점검이 한 루프에서 연달아 막히면 시간이 합산되므로 사이에 워치독을 리셋한다.
+  esp_task_wdt_reset();
   if (online) {
     checkBotHealth(currentMillis);
   }
 
   // 5. 원격 업데이트 (위 폴링에서 /update 메시지 확인 처리가 끝난 뒤 실행)
   if (pendingUpdateUrl.length() > 0) {
+    esp_task_wdt_reset();
     String url = pendingUpdateUrl;
     pendingUpdateUrl = "";
     startRemoteUpdate(url);
